@@ -16,7 +16,6 @@ namespace MatchPing
 		{
 			public string Provider, Region;   // gcp europe-west4, aws eu-west-1
 			public string Name;               // Netherlands
-			public string Endpoint;           // where the region answers: gcp: GCPing's HTTPS URL, aws: DynamoDB's host
 			public string Cloud => Provider == "gcp" ? "Google Cloud" : Provider == "aws" ? "AWS" : Provider;
 			public string Network => Provider == "gcp" ? "Google's network" : Provider == "aws" ? "Amazon's network" : "the server's network";
 		}
@@ -25,16 +24,13 @@ namespace MatchPing
 
 		readonly object gate = new object();
 		List<Range> ranges = new List<Range>();
-		Dictionary<string, string[]> gcping = new Dictionary<string, string[]>();   // region -> URL, name
 		static string FilePath => Path.Combine(Settings.LocalDir, "ranges.txt");
 
 		/// <summary>The cached lists; a new download in the background when they are a week old (wait: now).</summary>
 		public void Load(bool wait = false)
 		{
 			try { if (File.Exists(FilePath)) Use(File.ReadAllLines(FilePath)); } catch (Exception) { }
-			bool noUrls;
-			lock (gate) noUrls = gcping.Count == 0;
-			if (!File.Exists(FilePath) || File.GetLastWriteTimeUtc(FilePath) < DateTime.UtcNow.AddDays(-7) || noUrls)
+			if (!File.Exists(FilePath) || File.GetLastWriteTimeUtc(FilePath) < DateTime.UtcNow.AddDays(-7))
 				if (wait) Update(); else new Thread(Update) { IsBackground = true, Name = "ranges" }.Start();
 		}
 
@@ -49,11 +45,7 @@ namespace MatchPing
 			lock (gate)
 				foreach (var r in ranges)
 					if ((r.Provider == "gcp" || r.Provider == "aws") && In(n, r) && (!found || r.Len > best.Len)) { best = r; found = true; }
-			if (!found) return null;
-			var p = new Place { Provider = best.Provider, Region = best.Region, Name = Name(best.Provider, best.Region) };
-			if (p.Provider == "aws") p.Endpoint = $"dynamodb.{p.Region}.amazonaws.com";
-			else lock (gate) if (gcping.TryGetValue(p.Region, out var e)) { p.Endpoint = e[0]; if (e[1].Length > 0) p.Name = e[1]; }
-			return p;
+			return found ? new Place { Provider = best.Provider, Region = best.Region, Name = Name(best.Provider, best.Region) } : null;
 		}
 
 		/// <summary>Whether an address belongs to that cloud (gcp: anything Google, aws: anything Amazon).</summary>
@@ -83,16 +75,6 @@ namespace MatchPing
 					string svc = p.TryGetValue("service", out var s) ? s as string : "";
 					if (svc == "EC2" || svc == "AMAZON") lines.Add($"{p["ip_prefix"]} {(svc == "EC2" ? "aws" : "amazon")} {p["region"]}");
 				}
-				// GCPing (https://gcping.com, a Google Cloud open-source project): one small HTTPS service per Google
-				// Cloud region, to measure the round trip to the region
-				try
-				{
-					if (js.DeserializeObject(Download("https://global.gcping.com/api/endpoints")) is Dictionary<string, object> eps)
-						foreach (var kv in eps)
-							if (kv.Value is Dictionary<string, object> e && e.TryGetValue("URL", out var url) && url is string u && u.StartsWith("https://"))
-								lines.Add($"url {kv.Key} {u} {((e.TryGetValue("RegionName", out var n) ? n as string : null) ?? "").Replace(' ', '_')}");
-				}
-				catch (Exception) { }
 				if (lines.Count < 1000) return;   // something went wrong: keep what there is
 				Directory.CreateDirectory(Settings.LocalDir);
 				File.WriteAllLines(FilePath, lines);
@@ -122,17 +104,15 @@ namespace MatchPing
 		void Use(string[] lines)
 		{
 			var list = new List<Range>(lines.Length);
-			var urls = new Dictionary<string, string[]>();
 			foreach (var line in lines)
 			{
 				var f = line.Split(' ');
-				if (f.Length < 3) continue;
-				if (f[0] == "url") { urls[f[1]] = new[] { f[2], f.Length > 3 ? f[3].Replace('_', ' ') : "" }; continue; }
+				if (f.Length < 3 || f[0] == "url") continue;
 				var c = f[0].Split('/');
 				if (c.Length != 2 || !IPAddress.TryParse(c[0], out var a) || !int.TryParse(c[1], out int len)) continue;
 				list.Add(new Range { Net = Num(a), Len = len, Provider = f[1], Region = f[2] });
 			}
-			lock (gate) { ranges = list; gcping = urls; }
+			lock (gate) ranges = list;
 		}
 
 		static bool In(uint n, Range r) => r.Len == 0 || (n ^ r.Net) >> (32 - r.Len) == 0;

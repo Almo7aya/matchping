@@ -53,6 +53,8 @@ namespace MatchPing
 		static HwndSource keys;
 		static bool gameRunning, hotkey;
 		static int[] gamePids = new int[0];
+		static Reading last = new Reading();
+		static int ticks;
 		static Forms.ToolStripMenuItem miOn, miMenus, miMove, miDetails, miGraph, miStartup;
 		static Forms.ToolStripMenuItem[] miInfo, miSizes, miBoxes;
 		static readonly double[] Sizes = { 0.8, 1, 1.25, 1.5, 2 };
@@ -67,6 +69,7 @@ namespace MatchPing
 			if (Arg("--write-icon") is string ico) { WriteIcon(ico); return; }
 			if (Arg("--snapshot") is string snap) { SnapshotStates(snap); return; }
 			if (Arg("--etw-test") is string test) { EtwTest(test, args.Contains("--wait-match")); return; }
+			if (Arg("--beacon-test") is string beacon) { Tests.BeaconTest(beacon); return; }
 			if (Arg("--probe") is string probe) { Probe(probe, Arg(probe) ?? "matchping-probe.txt"); return; }
 			demo = args.Contains("--demo");
 			bool elevated = args.Contains("--elevated");
@@ -142,12 +145,32 @@ namespace MatchPing
 			string state = !set.Enabled ? "off (Ctrl+Alt+P)" : !game ? "waiting for THE FINALS" : r.Lost ? "lost" : r.Now != null && r.Status == null ? Math.Round(r.Now.Value) + " ms" : r.Status ?? "…";
 			string text = "MatchPing · " + state;
 			tray.Text = text.Length > 63 ? text.Substring(0, 62) + "…" : text;
+			last = r;
+			if (game && ++ticks % 5 == 0)
+				try { Directory.CreateDirectory(Settings.LocalDir); File.WriteAllText(Path.Combine(Settings.LocalDir, "status.txt"), Details(r)); } catch (Exception) { }
 			if (miInfo != null)
 			{
 				var info = (!demo && !admin ? new[] { "Needs administrator rights to see the game's traffic: restart MatchPing" } : r.Info)
 					.Concat(Enumerable.Repeat("", miInfo.Length)).Take(miInfo.Length).ToArray();
 				for (int i = 0; i < miInfo.Length; i++) { miInfo[i].Text = info[i]; miInfo[i].Visible = info[i].Length > 0; }
 			}
+		}
+
+		/// <summary>What it measures and the numbers, for status.txt (every 5 s while the game runs) and "Copy details".</summary>
+		static string Details(Reading r)
+		{
+			var inv = System.Globalization.CultureInfo.InvariantCulture;
+			string N(double? v) => v != null ? v.Value.ToString("0.#", inv) : "-";
+			var lines = new List<string>
+			{
+				$"MatchPing {Version} · {DateTime.Now:yyyy-MM-dd HH:mm:ss} · administrator: {admin} · game running: {gameRunning}",
+				$"shown: {(r.Lost ? "lost" : N(r.Now) + " ms")} · median {N(r.Median)} · jitter {N(r.Jitter)} · loss {N(r.Loss)} % · {r.Level}" +
+					(r.Status != null ? " · " + r.Status : "") + (r.Note != null ? " · " + r.Note : ""),
+			};
+			lines.AddRange(r.Info);
+			lines.Add("last pings (s ago: ms): " + string.Join("  ", r.Last60.Skip(Math.Max(0, r.Last60.Count - 15))
+				.Select(s => $"{Stats.Now() - s.Ts}:{(s.Ping != null ? N(s.Ping) : "x")}")));
+			return string.Join(Environment.NewLine, lines) + Environment.NewLine;
 		}
 
 		static void CheckGame()
@@ -215,6 +238,7 @@ namespace MatchPing
 			miGraph = Item(m, "Last 60 s graph", () => { set.Graph = !set.Graph; Changed(); });
 			m.Items.Add(new Forms.ToolStripSeparator());
 			miStartup = Item(m, "Start with Windows", () => Startup(!Startup()));
+			Item(m, "Copy details (for a bug report)", () => { try { Forms.Clipboard.SetText(Details(last)); } catch (Exception) { } });
 			Item(m, "About MatchPing (GitHub)", () => Open(Repo));
 			m.Items.Add(new Forms.ToolStripSeparator());
 			Item(m, "Quit", () => Application.Current.Shutdown());
@@ -418,17 +442,9 @@ namespace MatchPing
 			var (target, hop, inNetwork) = Direct.Probe(regions, ip, place?.Provider, outp.Add);
 			outp.Add(target == null ? "result: nothing on the way answers pings" :
 				$"result: ping {target} once a second" + (hop == 0 ? " (the server)" : $" (hop {hop}, {(inNetwork ? "where " + place?.Network + " begins" : "before " + (place?.Network ?? "the server's network"))})"));
-			if (place?.Endpoint != null)
-			{
-				if (target != null && hop > 0)
-				{
-					var (o, h, reg) = Direct.Offset(target, place);
-					outp.Add($"the way on: router {h:0} ms, {place.Name} region {reg:0} ms ({place.Endpoint}) -> + {o:0} ms on every ping");
-				}
-				else if (target == null)
-					outp.Add($"instead: the round trip to {place.Name} every 5 s ({place.Endpoint}): now {Direct.RegionRtt(place, 3):0} ms");
-			}
-			else outp.Add("no way to measure the region itself (not a Google Cloud or AWS server, or no address lists yet)");
+			if (target != null && hop > 0)
+				outp.Add("in a match, the way on from that router to the server comes from the game's own checks while matchmaking " +
+					"(they need the game and administrator rights, so --probe can't show them)");
 			File.WriteAllLines(file, outp);
 		}
 

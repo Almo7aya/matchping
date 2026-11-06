@@ -1,11 +1,8 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
-using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -16,18 +13,18 @@ namespace MatchPing
 	/// - Game servers do not answer pings, so when the match starts one traceroute finds the last router on the way
 	///   that does; it is pinged once a second (~0.4 MB an hour): that shows the line's spikes and losses as they come.
 	/// - That router is usually where the cloud's network begins, near the player: Google carries the rest of the way
-	///   on its own backbone, which does not answer pings. So at the start and every 5 minutes the round trip to the
-	///   server's region itself is measured (Google Cloud: GCPing's HTTPS service in that region; AWS: a TCP handshake
-	///   with DynamoDB there) and the difference is added to every ping.
-	/// - When nothing on the way answers pings, the region's round trip is measured every 5 s instead.</summary>
+	///   on its own backbone, which does not answer pings. But while matchmaking the game itself times candidate
+	///   servers (UDP to port 7600; the one it then plays on among them), and the tracing sees those packets go and
+	///   come back. The difference between that round trip and the router's is added to every ping. Nothing extra is
+	///   sent for it, and nothing goes to anyone but the routers on the way.
+	/// - When nothing on the way answers pings, the game's own round trip is shown, as measured before the match.</summary>
 	sealed class Direct : ISource
 	{
 		static readonly byte[] Payload = new byte[16];
 		const int MinRate = 10;        // packets a second: a match (the game sends 30-60), not a menu's odd packet
 		const int SwitchAfter = 3;     // seconds another server must lead before it is the match server
 		const int OverAfter = 20;      // seconds without a match flow: the match is over
-		const int Recalibrate = 300;   // seconds between measurements of the way on to the region
-		const int RegionEvery = 5;     // seconds between region measurements when nothing on the way answers
+		const int ChecksFor = 10;      // minutes the game's own checks count for a match
 
 		readonly Etw etw = new Etw();
 		readonly Regions regions;
@@ -46,10 +43,10 @@ namespace MatchPing
 		IPAddress target;              // what is pinged once a second
 		int targetHop;                 // its hop (0: the server itself)
 		bool inNetwork;                // a router inside the server's cloud
-		double? offset;                // ms from that router on to the region (added to its pings)
-		long calibratedAt;
-		bool calibrating, calibrationFailed;
-		bool regionMode, regionBusy;   // nothing on the way answers: the region's round trip every 5 s
+		double? offset;                // ms from that router on to the server (added to its pings)
+		double? gameRtt;               // the game's own round trip, before the match
+		bool gameExact;                // to this very server (else to others in its region)
+		bool calibrating, calibrated;
 
 		public Direct(Regions regions, Func<int[]> gamePids)
 		{
@@ -105,21 +102,17 @@ namespace MatchPing
 				}
 				if (server != 0 && now - lastFlow > OverAfter) Forget();
 				g = gen;
-				var p = place;
 				if (target != null)
 				{
 					ping = target;
-					if (targetHop > 0 && p?.Endpoint != null && !calibrating && now - calibratedAt >= Recalibrate)
+					if (targetHop > 0 && !calibrating && !calibrated)
 					{
 						calibrating = true;
 						var t = target;
-						ThreadPool.QueueUserWorkItem(_ => Calibrate(g, t, p));
+						var ip = Etw.Address(server);
+						var p = place;
+						ThreadPool.QueueUserWorkItem(_ => Calibrate(g, t, ip, p));
 					}
-				}
-				else if (regionMode && !regionBusy && now % RegionEvery == 0)
-				{
-					regionBusy = true;
-					ThreadPool.QueueUserWorkItem(_ => RegionSample(g, p, now));
 				}
 			}
 			if (ping != null) Ping(g, ping, now);
@@ -145,9 +138,9 @@ namespace MatchPing
 			target = null;
 			targetHop = 0;
 			inNetwork = false;
-			offset = null;
-			calibratedAt = 0;
-			routing = calibrating = calibrationFailed = regionMode = regionBusy = false;
+			offset = gameRtt = null;
+			gameExact = false;
+			routing = calibrating = calibrated = false;
 			samples.Clear();
 			gen++;
 		}
@@ -155,6 +148,7 @@ namespace MatchPing
 		void Route(int g, IPAddress ip, Regions.Place p)
 		{
 			var (found, hop, isIn) = Probe(regions, ip, p?.Provider, null);
+			var (rtt, exact) = GameRtt(ip, p);
 			lock (gate)
 			{
 				if (g != gen) return;
@@ -162,8 +156,21 @@ namespace MatchPing
 				target = found;
 				targetHop = hop;
 				inNetwork = isIn;
-				regionMode = found == null && p?.Endpoint != null;
+				gameRtt = rtt;
+				gameExact = exact;
 			}
+		}
+
+		/// <summary>What the game measured before the match: to this very server (its port 7600), else the best to the
+		/// other servers it checked in the same region; the lowest of the bursts.</summary>
+		(double? rtt, bool exact) GameRtt(IPAddress ip, Regions.Place p)
+		{
+			var checks = etw.Checks(ChecksFor);
+			var mine = checks.Where(c => c.Key.Equals(ip)).Select(c => c.Value).ToList();
+			if (mine.Count > 0) return (mine.Min(), true);
+			if (p == null) return (null, false);
+			var near = checks.Where(c => regions.Lookup(c.Key)?.Region == p.Region).Select(c => c.Value).ToList();
+			return near.Count > 0 ? (near.Min(), false) : ((double?)null, false);
 		}
 
 		/// <summary>What to ping for a server: the server when it answers pings; else the last router on the way that
@@ -190,22 +197,9 @@ namespace MatchPing
 			return (null, 0, false);
 		}
 
-		/// <summary>The way on from the router to the region: the region's round trip minus the router's (the lowest
-		/// of a few of each, measured together).</summary>
-		void Calibrate(int g, IPAddress hop, Regions.Place p)
-		{
-			var (o, _, _) = Offset(hop, p);
-			lock (gate)
-			{
-				if (g != gen) return;
-				calibrating = false;
-				calibratedAt = Stats.Now();
-				if (o != null) { offset = o; calibrationFailed = false; }
-				else if (offset == null) calibrationFailed = true;
-			}
-		}
-
-		public static (double? offset, double? hop, double? region) Offset(IPAddress hop, Regions.Place p)
+		/// <summary>The way on from the router to the server: the game's round trip minus the router's (the lowest of
+		/// 5 pings now). Once per match: the game measures only while matchmaking.</summary>
+		void Calibrate(int g, IPAddress hop, IPAddress ip, Regions.Place p)
 		{
 			double? h = null;
 			for (int i = 0; i < 5; i++)
@@ -214,69 +208,15 @@ namespace MatchPing
 				if (r != null && (h == null || r < h)) h = r;
 				Thread.Sleep(100);
 			}
-			var reg = RegionRtt(p, 5);
-			return (h != null && reg != null ? Math.Max(0, reg.Value - h.Value) : (double?)null, h, reg);
-		}
-
-		void RegionSample(int g, Regions.Place p, long ts)
-		{
-			var ms = RegionRtt(p, 1);
+			var (rtt, exact) = GameRtt(ip, p);
 			lock (gate)
 			{
 				if (g != gen) return;
-				regionBusy = false;
-				Add(new Sample { Ts = ts, Ping = ms });
+				calibrating = false;
+				calibrated = true;
+				if (rtt != null) { gameRtt = rtt; gameExact = exact; }
+				if (h != null && gameRtt != null) offset = Math.Max(0, gameRtt.Value - h.Value);
 			}
-		}
-
-		static DateTime lastHttps = DateTime.MinValue;
-
-		/// <summary>The round trip to a region itself (the lowest of n). Google Cloud: HTTPS requests to GCPing's service
-		/// there on one kept-alive connection, timed to the first byte of its tiny answer (a request that has to open
-		/// the connection is not counted). AWS: TCP handshakes with DynamoDB's endpoint there.</summary>
-		public static double? RegionRtt(Regions.Place p, int n)
-		{
-			if (p?.Endpoint == null) return null;
-			double? best = null;
-			try
-			{
-				if (p.Provider == "gcp")
-				{
-					bool warm = (DateTime.UtcNow - lastHttps).TotalSeconds < 60;
-					for (int i = warm ? 1 : 0; i <= n; i++)
-					{
-						var req = (HttpWebRequest)WebRequest.Create(p.Endpoint + "/api/ping");
-						req.Timeout = 5000;
-						req.UserAgent = "MatchPing";
-						var sw = Stopwatch.StartNew();
-						using (var resp = req.GetResponse())
-						{
-							double ms = sw.Elapsed.TotalMilliseconds;
-							using (var s = resp.GetResponseStream()) s.CopyTo(Stream.Null);
-							if (i > 0 && (best == null || ms < best)) best = ms;
-						}
-						lastHttps = DateTime.UtcNow;
-					}
-				}
-				else
-				{
-					var ip = Dns.GetHostAddresses(p.Endpoint).FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork);
-					if (ip == null) return null;
-					for (int i = 0; i < n; i++)
-						using (var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
-						{
-							var sw = Stopwatch.StartNew();
-							var ar = s.BeginConnect(ip, 443, null, null);
-							if (ar.AsyncWaitHandle.WaitOne(3000))
-							{
-								try { s.EndConnect(ar); double ms = sw.Elapsed.TotalMilliseconds; if (best == null || ms < best) best = ms; }
-								catch (SocketException) { }
-							}
-						}
-				}
-			}
-			catch (Exception) { }
-			return best;
 		}
 
 		static double? Echo(IPAddress ip, int tries)
@@ -324,7 +264,7 @@ namespace MatchPing
 			{
 				double? ms = task.Status == TaskStatus.RanToCompletion && task.Result.Status == IPStatus.Success ? task.Result.RoundtripTime : (double?)null;
 				lock (gate)
-					if (g == gen) Add(new Sample { Ts = now, Ping = ms + (offset ?? 0) });
+					if (g == gen) Add(new Sample { Ts = now, Ping = ms });   // the router's own; Read adds the way on
 				p.Dispose();
 			});
 		}
@@ -348,26 +288,34 @@ namespace MatchPing
 				r.InMatch = true;
 				r.Label = place?.Name ?? ip.ToString();
 				var info = new List<string> { $"Match server {ip}:{Etw.Port(server)}" + (place != null ? $" · {place.Cloud} {place.Region} ({place.Name})" : "") };
+				string game = gameRtt == null ? null : $"the game measured {gameRtt:0} ms to {(gameExact ? "this server" : "other " + r.Label + " servers")} before the match";
 				if (routing) r.Status = "finding a router near the server…";
-				else if (target == null && !regionMode) r.Status = "nothing on the way to the server answers pings";
-				else if (target != null && targetHop > 0 && offset == null && !calibrationFailed && place?.Endpoint != null) r.Status = $"measuring the way on to {r.Label}…";
+				else if (target != null && targetHop > 0 && !calibrated) r.Status = "measuring…";
 				if (r.Status != null) { info.Add(r.Status); r.Info = info.ToArray(); return r; }
 
-				if (regionMode)
+				if (target == null)
 				{
-					r.Note = "every 5 s";
-					info.Add($"Nothing on the way answers pings: the round trip to {place.Name} every {RegionEvery} s ({new Uri(place.Endpoint.Contains("://") ? place.Endpoint : "tcp://" + place.Endpoint).Host})");
+					// nothing on the way answers pings: what the game measured, if anything
+					info.Add("Nothing on the way to the server answers pings" + (game != null ? "; " + game : ""));
+					r.Info = info.ToArray();
+					if (gameRtt == null) { r.Status = "nothing on the way to the server answers pings"; return r; }
+					r.Now = gameRtt;
+					r.Level = Level.Normal;
+					r.Note = "measured by the game before the match";
+					return r;
 				}
-				else if (targetHop == 0) info.Add("Pinging the server itself, once a second");
+				if (targetHop == 0) info.Add("Pinging the server itself, once a second");
 				else
 				{
 					string where = inNetwork ? "where " + place?.Network + " begins" : "before " + (place?.Network ?? "the server's network");
 					info.Add($"Pinging {target} once a second (hop {targetHop}, {where})");
-					if (offset != null) info.Add($"+ {offset:0} ms on to {r.Label} (measured at the start and every {Recalibrate / 60} min)");
+					if (offset != null) info.Add($"+ {offset:0} ms on to the server: {game}");
 					else r.Note = $"hop {targetHop} only, not the whole way";
 				}
 				r.Info = info.ToArray();
-				Stats.Fill(r, samples, Stats.Now(), regionMode ? RegionEvery + 3 : 4);
+				// the way on, added to every ping kept (also those from before it was known): the line stays one line
+				double add = offset ?? 0;
+				Stats.Fill(r, samples.Select(s => new Sample { Ts = s.Ts, Measured = s.Measured, Ping = s.Ping + add }).ToList(), Stats.Now(), 4);
 				return r;
 			}
 		}

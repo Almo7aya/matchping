@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -13,17 +14,23 @@ namespace MatchPing
 	sealed class Etw : IDisposable
 	{
 		static readonly Guid KernelNetwork = new Guid("7DD42A49-5329-4832-8DFD-43D979153A88");
-		const string SessionName = "MatchPing";
+		readonly string SessionName;
 		const ushort UdpV4Sent = 42;            // "UDPv4: %2 bytes transmitted from %4:%6 to %3:%5"
+		const ushort UdpV4Received = 43;        // "UDPv4: %2 bytes received from %4:%6 to %3:%5"
 		const ulong KeywordIpv4 = 0x10;
-		// event 42's data: PID u32, size u32, daddr u32, saddr u32, dport u16, sport u16, ... (addresses and ports
+		// events 42 and 43: PID u32, size u32, daddr u32, saddr u32, dport u16, sport u16, ... (addresses and ports
 		// in network byte order)
-		const int OffPid = 0, OffDaddr = 8, OffDport = 16;
+		const int OffPid = 0, OffDaddr = 8, OffSaddr = 12, OffDport = 16, OffSport = 18;
+		// THE FINALS' own latency checks: while matchmaking, the game sends bursts of small UDP packets to port 7600 on
+		// candidate servers in every region (the one it then plays on among them) and times the answers
+		public const int CheckPort = 7600;
 		// x64 layouts: EVENT_TRACE_PROPERTIES is 120 bytes (+ room for the names), EVENT_TRACE_LOGFILEW 448
 		const int PropsSize = 120, NamesSize = 2048, LogfileSize = 448;
 
 		readonly object gate = new object();
 		Dictionary<ulong, int> counts = new Dictionary<ulong, int>();
+		readonly Dictionary<ulong, Queue<long>> pending = new Dictionary<ulong, Queue<long>>();   // the game's checks waiting for an answer
+		readonly List<Check> checks = new List<Check>();                                           // and their round trips
 		volatile int[] pids = new int[0];
 		ulong session, trace;
 		IntPtr props, logfile, loggerName;
@@ -34,6 +41,11 @@ namespace MatchPing
 		public bool Running { get; private set; }
 		/// <summary>--etw-test: every UDPv4 send event (pid, the first bytes of its data).</summary>
 		public Action<int, byte[]> Dump;
+		/// <summary>--beacon-test: every UDPv4 send and receive event (id, QueryPerformanceCounter time, the first 20
+		/// bytes of its data).</summary>
+		public Action<ushort, long, byte[]> Raw;
+
+		public Etw(string session = "MatchPing") { SessionName = session; }
 
 		/// <summary>The game's processes: only their packets are counted.</summary>
 		public void SetPids(int[] p) => pids = p ?? new int[0];
@@ -108,7 +120,7 @@ namespace MatchPing
 			thread = null;
 			Running = false;
 			Release();
-			lock (gate) counts.Clear();
+			lock (gate) { counts.Clear(); pending.Clear(); }
 		}
 
 		public void Dispose() => Stop();
@@ -120,16 +132,32 @@ namespace MatchPing
 			if (loggerName != IntPtr.Zero) { Marshal.FreeHGlobal(loggerName); loggerName = IntPtr.Zero; }
 		}
 
+		/// <summary>The round trips the game itself measured to port 7600 in the last minutes (address, ms).</summary>
+		public List<KeyValuePair<IPAddress, double>> Checks(int minutes)
+		{
+			long since = DateTime.UtcNow.ToFileTimeUtc() - minutes * 600000000L;
+			lock (gate)
+				return checks.Where(c => c.Ts >= since).Select(c => new KeyValuePair<IPAddress, double>(new IPAddress(c.Addr), c.Ms)).ToList();
+		}
+
 		void OnEvent(IntPtr rec)
 		{
 			try
 			{
-				if ((ushort)Marshal.ReadInt16(rec, 40) != UdpV4Sent) return;   // EventHeader.EventDescriptor.Id
+				ushort id = (ushort)Marshal.ReadInt16(rec, 40);                  // EventHeader.EventDescriptor.Id
+				if (id != UdpV4Sent && id != UdpV4Received) return;
 				int len = (ushort)Marshal.ReadInt16(rec, 86);                    // UserDataLength
 				IntPtr d = Marshal.ReadIntPtr(rec, 96);                          // UserData
-				if (len < OffDport + 2 || d == IntPtr.Zero) return;
+				if (len < 20 || d == IntPtr.Zero) return;
+				long ts = Marshal.ReadInt64(rec, 16);                            // EventHeader.TimeStamp: 100 ns (FILETIME, UTC)
+				if (Raw != null)
+				{
+					var raw = new byte[20];
+					Marshal.Copy(d, raw, 0, 20);
+					Raw(id, ts, raw);
+				}
 				int pid = Marshal.ReadInt32(d, OffPid);
-				if (Dump != null)
+				if (Dump != null && id == UdpV4Sent)
 				{
 					var b = new byte[Math.Min(len, 32)];
 					Marshal.Copy(d, b, 0, b.Length);
@@ -139,17 +167,42 @@ namespace MatchPing
 				bool game = false;
 				for (int i = 0; i < p.Length; i++) if (p[i] == pid) { game = true; break; }
 				if (!game) return;
-				uint addr = (uint)Marshal.ReadInt32(d, OffDaddr);
-				int port = Marshal.ReadByte(d, OffDport) << 8 | Marshal.ReadByte(d, OffDport + 1);
-				ulong key = (ulong)addr << 16 | (uint)port;
+				uint daddr = (uint)Marshal.ReadInt32(d, OffDaddr), saddr = (uint)Marshal.ReadInt32(d, OffSaddr);
+				int dport = Marshal.ReadByte(d, OffDport) << 8 | Marshal.ReadByte(d, OffDport + 1);
+				int sport = Marshal.ReadByte(d, OffSport) << 8 | Marshal.ReadByte(d, OffSport + 1);
+				ulong to = (ulong)daddr << 16 | (uint)dport;
 				lock (gate)
 				{
-					counts.TryGetValue(key, out int c);
-					counts[key] = c + 1;
+					if (id == UdpV4Sent)
+					{
+						counts.TryGetValue(to, out int c);
+						counts[to] = c + 1;
+						if (dport == CheckPort)   // one of the game's checks: wait for its answer
+						{
+							if (!pending.TryGetValue(to, out var q)) pending[to] = q = new Queue<long>();
+							q.Enqueue(ts);
+							while (q.Count > 8) q.Dequeue();
+						}
+					}
+					else
+					{
+						// an answer from port 7600 (the other end is on whichever side has it), paired with the oldest check
+						// waiting for it
+						ulong from = (ulong)saddr << 16 | (uint)sport;
+						ulong key = sport == CheckPort && pending.ContainsKey(from) ? from : dport == CheckPort && pending.ContainsKey(to) ? to : 0;
+						if (key != 0 && pending[key].Count > 0)
+						{
+							double ms = (ts - pending[key].Dequeue()) / 10000.0;
+							if (ms > 0 && ms < 2000) checks.Add(new Check { Ts = ts, Addr = (uint)(key >> 16), Ms = ms });
+							if (checks.Count > 5000) checks.RemoveRange(0, 1000);
+						}
+					}
 				}
 			}
 			catch (Exception) { }
 		}
+
+		struct Check { public long Ts; public uint Addr; public double Ms; }
 
 		static IntPtr Props()
 		{

@@ -29,22 +29,23 @@ installed, nothing touching the game:
 2. **Once a second.** One traceroute toward the server finds the last router on the way that answers pings —
    usually where Google's (or Amazon's) network begins — and MatchPing pings it every second. That is where your
    line's spikes and losses show up, as they happen.
-3. **The rest of the way.** Google carries traffic from there to the server's region on its own backbone, which
-   doesn't answer pings. So when the match starts, and every 5 minutes, MatchPing measures the round trip to the
-   region itself and adds the difference to every ping:
-   - Google Cloud: a few HTTPS requests to [GCPing](https://gcping.com)'s service in that region (an open-source
-     Google Cloud project made for exactly this), timed to the first byte on a kept-alive connection;
-   - AWS: a few TCP handshakes with that region's DynamoDB endpoint.
+3. **The rest of the way.** Google carries traffic from there to the server on its own backbone, which doesn't answer
+   pings. But while matchmaking, the game itself times the servers it might put you on (small UDP packets to their
+   port 7600) — and the one you then play on is among them. MatchPing sees those packets leave and their answers
+   come back in the same network tracing, so it knows the game's own round trip to your match server. The gap
+   between that and the router's ping is added to every ping. Nothing extra is sent for it.
 
 If the server itself answers pings, it is pinged directly. If nothing on the way answers (some networks drop them),
-the region's round trip is measured every 5 seconds instead, and the overlay says so.
+the overlay shows the game's own round trip from before the match, and says so. If MatchPing started after the
+match did, it missed the game's checks: it shows the router's ping and says it isn't the whole way.
 
 The result is close to the game's own round trip, but it is not the game's packets: routers answer pings with low
 priority, so a ping can show a spike the game didn't have, and a VPN or "game routing" tool that only carries the
 game's traffic takes a path the pings don't.
 
 **See for yourself**: `MatchPing.exe --probe <server address>` writes what it would ping for that server and why
-(the hops, which one answers, the region, the calibration).
+(the hops, which one answers, the region). During a match, right-click the tray icon: it lists the match server,
+the router it pings and what the game measured.
 
 ## Is it safe with anti-cheat?
 
@@ -60,8 +61,10 @@ No accounts, no telemetry, nothing sent anywhere about you. What goes over the n
 | What | When | How much |
 |---|---|---|
 | Pings to one router on the way to the match server | once a second during matches | ~0.4 MB an hour |
-| The region's round trip (GCPing / DynamoDB) | at the start of a match and every 5 minutes | a few KB |
+| A traceroute toward the match server | when a match starts | a few KB |
 | Google's and AWS's published address lists (which region a server is in) | once a week | ~3 MB |
+
+The game's own traffic is only watched (where it goes, when answers come back), never read, changed or added to.
 
 Settings are in `%APPDATA%\MatchPing\settings.json`, the address lists in `%LOCALAPPDATA%\MatchPing`.
 
