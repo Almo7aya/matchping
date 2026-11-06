@@ -1,0 +1,42 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Check
+        shell: pwsh
+        run: |
+          # every overlay state draws (nothing shown), and the .exe is 64-bit
+          Start-Process dist/MatchPing.exe -ArgumentList '--snapshot', "$PWD/dist/states.png" -Wait
+          if (-not (Test-Path dist/states.png)) { throw 'the snapshot was not written' }
+          (Get-FileHash dist/MatchPing.exe -Algorithm SHA256).Hash.ToLower() + '  MatchPing.exe' | Set-Content dist/MatchPing.exe.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MatchPing
+          path: |
+            dist/MatchPing.exe
+            dist/MatchPing.exe.sha256
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME dist/MatchPing.exe dist/MatchPing.exe.sha256 --title "MatchPing $env:GITHUB_REF_NAME" --generate-notes
