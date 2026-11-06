@@ -1,19 +1,43 @@
 name: build
 
+# Every push and pull request is built. A push to main whose VERSION has not been released yet also publishes it:
+# the tag v<VERSION>, and a release with MatchPing.exe and its SHA-256 (a version like 1.2.0-beta.1 is a pre-release).
+# To release: change VERSION (semver) and push.
+
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the tags: is this version out already?
+
+      - name: Version
+        id: version
+        shell: pwsh
+        run: |
+          $v = (Get-Content VERSION -Raw).Trim()
+          if ($v -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') { throw "VERSION '$v' is not semver (1.2.3 or 1.2.3-beta.1)" }
+          $tag = "v$v"
+          $released = [bool](git tag --list $tag)
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "new=$((-not $released).ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          "prerelease=$(($v -match '-').ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          "${tag}: $(if ($released) { 'released already, building only' } else { 'not released yet' })"
 
       - name: Build
         shell: pwsh
@@ -22,21 +46,33 @@ jobs:
       - name: Check
         shell: pwsh
         run: |
-          # every overlay state draws (nothing shown), and the .exe is 64-bit
+          # the .exe carries the version, and every overlay state draws (nothing shown)
+          $pv = (Get-Item dist/MatchPing.exe).VersionInfo.ProductVersion
+          if ($pv -ne '${{ steps.version.outputs.version }}') { throw "the .exe says $pv, VERSION says ${{ steps.version.outputs.version }}" }
           Start-Process dist/MatchPing.exe -ArgumentList '--snapshot', "$PWD/dist/states.png" -Wait
           if (-not (Test-Path dist/states.png)) { throw 'the snapshot was not written' }
           (Get-FileHash dist/MatchPing.exe -Algorithm SHA256).Hash.ToLower() + '  MatchPing.exe' | Set-Content dist/MatchPing.exe.sha256
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MatchPing
+          name: MatchPing-${{ steps.version.outputs.version }}
           path: |
             dist/MatchPing.exe
             dist/MatchPing.exe.sha256
 
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.version.outputs.new == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME dist/MatchPing.exe dist/MatchPing.exe.sha256 --title "MatchPing $env:GITHUB_REF_NAME" --generate-notes
+        run: |
+          $v = '${{ steps.version.outputs.version }}'
+          $sha = (Get-Content dist/MatchPing.exe.sha256).Split(' ')[0]
+          @"
+          Download **MatchPing.exe** below and run it (Windows 10/11, 64-bit; it asks for administrator rights to see which server the game talks to). See the [README](https://github.com/${{ github.repository }}#readme) for how it measures.
+
+          SHA-256 of MatchPing.exe: ``$sha``
+          "@ | Set-Content notes.md
+          $pre = if ('${{ steps.version.outputs.prerelease }}' -eq 'true') { '--prerelease' } else { $null }
+          gh release create '${{ steps.version.outputs.tag }}' dist/MatchPing.exe dist/MatchPing.exe.sha256 `
+            --target $env:GITHUB_SHA --title "MatchPing $v" --notes-file notes.md --generate-notes $pre

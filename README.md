@@ -84,8 +84,11 @@ THE FINALS in *Windowed fullscreen* and in *Fullscreen* (DirectX 12 has no exclu
 ```
 
 The C# compiler comes from the [.NET SDK](https://dotnet.microsoft.com/download) and compiles against the .NET
-Framework assemblies that ship with Windows: no NuGet packages, nothing downloaded. Every push is built on GitHub
-Actions; tagged versions (`v*`) are published as releases with the .exe and its SHA-256.
+Framework assemblies that ship with Windows: no NuGet packages, nothing downloaded.
+
+**Releases**: the version lives in [`VERSION`](VERSION) ([semver](https://semver.org): `1.2.3`, or `1.2.3-beta.1` for
+a pre-release). GitHub Actions builds every push; when `main` has a version that isn't released yet, it publishes
+`v<version>` with `MatchPing.exe` and its SHA-256. To release, change `VERSION` and push.
 
 | Argument | |
 |---|---|

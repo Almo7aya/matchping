@@ -28,9 +28,7 @@ using Media = System.Windows.Media;
 [assembly: AssemblyProduct("MatchPing")]
 [assembly: AssemblyDescription("Live ping overlay for THE FINALS")]
 [assembly: AssemblyCopyright("MIT License")]
-[assembly: AssemblyVersion("0.1.0.0")]
-[assembly: AssemblyFileVersion("0.1.0.0")]
-[assembly: AssemblyInformationalVersion("0.1.0")]
+// the version attributes come from VERSION: build.ps1 writes them into dist\obj\Version.cs
 
 namespace MatchPing
 {
@@ -41,7 +39,7 @@ namespace MatchPing
 	/// --etw-test file.txt [--wait-match] (checks Windows' network tracing and writes what it saw).</summary>
 	static class App
 	{
-		public const string Version = "0.1.0";
+		public const string Version = Build.Version;
 		public const string Repo = "https://github.com/Almo7aya/matchping";
 
 		static Settings set;
